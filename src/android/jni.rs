@@ -869,7 +869,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                 if crate::TEXT_INPUT_DIRTY.load(Ordering::Acquire) {
                     super::frame_source::schedule_frame();
                 }
-                if super::frame_source::take_frame() {
+                super::frame_source::draw_if_due(|| {
                     if let Some(win) = platform.primary_window() {
                         win.request_frame();
                     }
@@ -879,7 +879,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                     // in get_current_texture / present).
                     drain_events(app);
                     process_input_events(app);
-                }
+                });
             }
         }
     }

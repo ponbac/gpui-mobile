@@ -11,15 +11,9 @@
 //! callback is posted or a frame is already due is folded into it, so a
 //! window that is notified fifty times between two vsyncs still draws once.
 //!
-//! Waiting for a vsync only makes sense while the loop keeps up with them.
-//! Once the previous frame took a whole interval or longer, the vsync it
-//! would wait for has already passed, and waiting for the next one only
-//! delays the frame (and the input batched behind it — GPUI stamps touches
-//! when they are dispatched, and a gap over 40 ms between samples kills a
-//! fling). Such demand is served at once; a loop that is behind draws
-//! back-to-back, exactly as it did before pacing, and returns to vsync
-//! pacing as soon as a frame fits the interval again. The first frame after
-//! an idle period is served at once for the same reason.
+//! The first demand after an idle interval can draw immediately. Demand
+//! during a frame, or shortly after it finishes, waits for vsync. Time
+//! spent drawing and waiting for a swapchain image is active time.
 //!
 //! Without a vsync source (no looper on the thread, tests) the pacer falls
 //! back to a wall clock: demand becomes due one frame interval after the
@@ -39,9 +33,7 @@ pub(crate) type PostVsync = Box<dyn Fn()>;
 pub(crate) struct FramePacer {
     /// `None` paces by wall clock at `interval`.
     post_vsync: Option<PostVsync>,
-    /// The display's refresh interval: how long a frame may take before the
-    /// next one stops waiting for a vsync, and the spacing of the fallback
-    /// clock.
+    /// Idle threshold for vsync and spacing for the fallback clock.
     interval: Duration,
     /// A vsync callback is posted and has not fired yet.
     posted: Cell<bool>,
@@ -50,8 +42,9 @@ pub(crate) struct FramePacer {
     due: Cell<bool>,
     /// Fallback only: demand is waiting for this instant.
     fallback_due_at: Cell<Option<Instant>>,
-    /// Fallback only: when the previous frame was taken, to space the next.
+    /// Vsync: when drawing finished. Clock: when the frame was taken.
     last_frame_at: Cell<Option<Instant>>,
+    drawing: Cell<bool>,
 }
 
 impl FramePacer {
@@ -66,6 +59,7 @@ impl FramePacer {
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
             last_frame_at: Cell::new(None),
+            drawing: Cell::new(false),
         }
     }
 
@@ -78,12 +72,13 @@ impl FramePacer {
             due: Cell::new(false),
             fallback_due_at: Cell::new(None),
             last_frame_at: Cell::new(None),
+            drawing: Cell::new(false),
         }
     }
 
     /// Records demand for a frame. The first demand since the last frame
     /// posts a vsync callback; later ones ride on it. Demand that arrives an
-    /// interval or more after the last frame began is due at once (see the
+    /// interval or more after the last frame finished is due at once (see the
     /// module docs).
     pub(crate) fn schedule(&self, now: Instant) {
         if self.posted.get() || self.due.get() || self.fallback_due_at.get().is_some() {
@@ -94,7 +89,7 @@ impl FramePacer {
             .get()
             .is_none_or(|last| now.duration_since(last) >= self.interval);
         match &self.post_vsync {
-            Some(_) if interval_elapsed => self.due.set(true),
+            Some(_) if !self.drawing.get() && interval_elapsed => self.due.set(true),
             Some(post) => {
                 self.posted.set(true);
                 post();
@@ -119,7 +114,7 @@ impl FramePacer {
     /// and only then; a frame left untaken (window inactive) stays due.
     pub(crate) fn take_frame(&self, now: Instant) -> bool {
         if self.due.replace(false) {
-            self.last_frame_at.set(Some(now));
+            self.drawing.set(true);
             return true;
         }
         match self.fallback_due_at.get() {
@@ -129,6 +124,12 @@ impl FramePacer {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub(crate) fn finish_frame(&self, now: Instant) {
+        if self.drawing.replace(false) {
+            self.last_frame_at.set(Some(now));
         }
     }
 
@@ -179,6 +180,7 @@ mod tests {
             FramePacer::with_vsync(Box::new(move || counter.set(counter.get() + 1)), INTERVAL);
         pacer.schedule(now);
         assert!(pacer.take_frame(now), "the first frame is served at once");
+        pacer.finish_frame(now);
         (pacer, posts)
     }
 
@@ -250,12 +252,11 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_overran_the_interval_is_served_at_once() {
+    fn demand_after_an_idle_interval_is_served_at_once() {
         let now = Instant::now();
         let (pacer, posts) = vsync_pacer_after_frame(now);
 
-        // The frame taken at `now` took 40 ms; the vsync it would wait for
-        // has passed, so the demand it re-raised is due right away.
+        // No demand arrived for 40 ms after the frame finished.
         let later = now + Duration::from_millis(40);
         pacer.schedule(later);
 
@@ -266,6 +267,26 @@ mod tests {
         // Back within the interval: vsync pacing again.
         pacer.schedule(later + Duration::from_millis(5));
         assert_eq!(posts.get(), 1);
+    }
+
+    #[test]
+    fn a_slow_frame_waits_for_vsync_when_animation_continues() {
+        let start = Instant::now();
+        let (pacer, posts) = vsync_pacer_after_frame(start);
+        pacer.schedule(start);
+        pacer.on_vsync();
+        assert!(pacer.take_frame(start + INTERVAL));
+        let end = start + 4 * INTERVAL;
+        pacer.schedule(end);
+        assert_eq!(posts.get(), 2);
+        assert!(!pacer.take_frame(end));
+        pacer.finish_frame(end);
+        pacer.on_vsync();
+        assert!(pacer.take_frame(end + INTERVAL));
+        pacer.finish_frame(end + 4 * INTERVAL);
+        pacer.schedule(end + 4 * INTERVAL);
+        assert_eq!(posts.get(), 3);
+        assert!(!pacer.take_frame(end + 4 * INTERVAL));
     }
 
     #[test]

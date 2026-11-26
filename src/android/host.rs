@@ -397,10 +397,8 @@ fn render_thread(launch: Launch) {
         }
         let window = attached_window(&app);
         let can_draw = window.as_ref().is_some_and(|win| win.is_active());
-        if can_draw && super::frame_source::take_frame() {
-            if let Some(win) = &window {
-                win.request_frame();
-            }
+        if let Some(win) = window.as_ref().filter(|_| can_draw) {
+            super::frame_source::draw_if_due(|| win.request_frame());
         }
 
         // Sleep on the looper until a command, a dispatcher task or the vsync

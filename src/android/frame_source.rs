@@ -18,7 +18,7 @@
 //! 2. The first demand since the last frame asks the vsync thread to post
 //!    one `AChoreographer` frame callback. When it fires, the vsync thread
 //!    marks a frame due and wakes the loop's `ALooper`.
-//! 3. The loop takes the due frame with [`take_frame`] and ticks GPUI once.
+//! 3. The loop takes the due frame with [`draw_if_due`] and ticks GPUI once.
 //!    A frame that left the window dirty (an animation, a fling) re-raises
 //!    demand from inside the tick, which posts the next callback.
 //!
@@ -54,8 +54,8 @@ use crate::frame_pacer::FramePacer;
 /// this much latency instead of a frozen app.
 const IDLE_POLL_CAP: Duration = Duration::from_secs(1);
 
-/// The refresh interval the pacer assumes: a frame slower than this stops
-/// waiting for vsyncs, and the clock fallback spaces frames by it. 60 Hz is
+/// The refresh interval the pacer assumes: an idle interval allows
+/// immediate demand, and the clock fallback spaces frames by it. 60 Hz is
 /// the common case; a faster display only makes an overrunning frame wait
 /// one extra vsync before pacing gives way.
 const REFRESH_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -215,13 +215,16 @@ pub(crate) fn resume() {
     }
 }
 
-/// Whether the loop should tick GPUI now. Call once per loop iteration,
+/// Ticks GPUI once if a frame is due. Call once per loop iteration,
 /// only while the window can draw; a frame left untaken stays due.
-pub(crate) fn take_frame() -> bool {
+pub(crate) fn draw_if_due(draw: impl FnOnce()) {
     if OFF_THREAD_DEMAND.swap(false, Ordering::AcqRel) {
         schedule_frame();
     }
-    with_pacer(|pacer| pacer.take_frame(Instant::now())).unwrap_or(false)
+    if with_pacer(|pacer| pacer.take_frame(Instant::now())).unwrap_or(false) {
+        draw();
+        with_pacer(|pacer| pacer.finish_frame(Instant::now()));
+    }
 }
 
 /// How long the loop may block on its looper: zero with a frame due, up to
